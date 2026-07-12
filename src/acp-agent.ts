@@ -1,3 +1,7 @@
+// MODIFIED by Product Factory (2026-07): streamEventToAcpNotifications gains an
+// env-gated (FACTORY_STREAM_TOOL_INPUT=1) relay of input_json_delta as
+// tool_call_update partial input. Fork of @agentclientprotocol/claude-agent-acp
+// v0.58.1 (Apache-2.0); upstream LICENSE retained. See FORK.md.
 import {
   agent as acpAgent,
   AgentContext,
@@ -5398,6 +5402,68 @@ export function streamEventToAcpNotifications(
   },
 ): SessionNotification[] {
   const event = message.event;
+  // ── FACTORY PATCH (input-streaming, env-gated): relay partial tool input ──
+  // Upstream drops `input_json_delta` (a no-op case in toAcpNotifications), so
+  // tool input only surfaces when the tool call completes. For file tools we
+  // relay each delta as a `tool_call_update` carrying
+  // `_meta.claudeCode.inputJsonDelta = { seq, partialJson }`, letting consumers
+  // reassemble streaming Write/Edit input (e.g. live design artifact paint).
+  // Default off: byte-identical to upstream unless FACTORY_STREAM_TOOL_INPUT=1.
+  if (process.env.FACTORY_STREAM_TOOL_INPUT === "1") {
+    type FactoryBlockIndex = Record<
+      number,
+      { id: string; name: string; seq: number }
+    >;
+    const FACTORY_FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+    const cache = toolUseCache as ToolUseCache & {
+      __factoryBlockIndex?: FactoryBlockIndex;
+    };
+    const factoryIdx = (cache.__factoryBlockIndex ??= {});
+    if (
+      event.type === "content_block_start" &&
+      event.content_block.type === "tool_use" &&
+      FACTORY_FILE_TOOLS.has(event.content_block.name)
+    ) {
+      factoryIdx[event.index] = {
+        id: event.content_block.id,
+        name: event.content_block.name,
+        seq: 0,
+      };
+    } else if (
+      event.type === "content_block_delta" &&
+      event.delta.type === "input_json_delta"
+    ) {
+      const entry = factoryIdx[event.index];
+      if (
+        entry &&
+        typeof event.delta.partial_json === "string" &&
+        event.delta.partial_json.length > 0
+      ) {
+        entry.seq += 1;
+        return [
+          {
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: entry.id,
+              _meta: {
+                claudeCode: {
+                  toolName: entry.name,
+                  inputJsonDelta: {
+                    seq: entry.seq,
+                    partialJson: event.delta.partial_json,
+                  },
+                },
+              },
+            },
+          },
+        ];
+      }
+    } else if (event.type === "content_block_stop") {
+      delete factoryIdx[event.index];
+    }
+  }
+  // ── END FACTORY PATCH ──
   switch (event.type) {
     case "content_block_start":
       return toAcpNotifications(
