@@ -8,10 +8,13 @@ import {
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
+  AgentOutput,
   AskUserQuestionInput,
   BashInput,
+  BashOutput,
   FileEditInput,
   FileReadInput,
+  FileReadOutput,
   FileWriteInput,
   GlobInput,
   GrepInput,
@@ -22,6 +25,7 @@ import {
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
+  WebSearchOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
   ImageBlockParam,
@@ -56,7 +60,6 @@ import {
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import path from "node:path";
-import { Logger } from "./acp-agent.js";
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -486,6 +489,88 @@ export function toolInfoFromToolUse(
   }
 }
 
+/**
+ * Narrow the untyped message-level `tool_use_result` toward a per-tool Output
+ * shape: rejects everything but a plain non-null object (arrays pass a bare
+ * `typeof === "object"` check, so they're excluded here). The returned value
+ * is only *nominally* typed — it arrives over the wire from arbitrary CLI
+ * versions, so each caller must still guard the specific fields it reads
+ * before trusting them.
+ */
+function structuredResult<T extends object>(toolUseResult: unknown): T | undefined {
+  return toolUseResult !== null &&
+    typeof toolUseResult === "object" &&
+    !Array.isArray(toolUseResult)
+    ? (toolUseResult as T)
+    : undefined;
+}
+
+/**
+ * Strip the model-directed trailer from a raw Agent/Task tool_result text:
+ * a `<usage>…</usage>` totals block and/or an
+ * `agentId: <id> (use SendMessage …)` continuation line at the end of the
+ * text. Both patterns are tail-anchored and independent (older CLIs emit
+ * variants with only one of them), so a format change makes them stop
+ * matching rather than mangle the report.
+ */
+function stripAgentTrailer(text: string): string {
+  return stripAgentIdLine(stripUsageBlock(text));
+}
+
+const USAGE_OPEN = "<usage>";
+const USAGE_CLOSE = "</usage>";
+
+/** Remove a trailing `<usage>…</usage>` block, plus trailing whitespace and
+ *  one preceding newline. Matches from the *last* `<usage>` so a report that
+ *  merely mentions the marker earlier isn't truncated at the mention. */
+function stripUsageBlock(text: string): string {
+  const body = text.trimEnd();
+  if (!body.endsWith(USAGE_CLOSE)) {
+    return text;
+  }
+  const open = body.lastIndexOf(USAGE_OPEN, body.length - USAGE_CLOSE.length - USAGE_OPEN.length);
+  if (open === -1) {
+    return text;
+  }
+  return body.slice(0, open > 0 && body[open - 1] === "\n" ? open - 1 : open);
+}
+
+/** The continuation line, anchored to a whole line so the regex has a single
+ *  start position and no ambiguous repetition (`[\w-]+` can't consume the
+ *  following space, `[^)]*` can't consume the closing paren) — it runs in
+ *  linear time on any input. */
+const AGENT_ID_LINE = /^agentId: [\w-]+ \([^)]*\)$/;
+
+/** Remove a final `agentId: <id> (…)` line, plus trailing whitespace and the
+ *  newline that preceded the line. */
+function stripAgentIdLine(text: string): string {
+  const body = text.trimEnd();
+  const lineStart = body.lastIndexOf("\n") + 1;
+  if (!AGENT_ID_LINE.test(body.slice(lineStart))) {
+    return text;
+  }
+  return body.slice(0, Math.max(lineStart - 1, 0));
+}
+
+/** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
+ *  string or block array), leaving non-text blocks untouched. */
+function stripAgentTrailerFromContent(content: unknown): unknown {
+  if (typeof content === "string") {
+    return stripAgentTrailer(content);
+  }
+  if (Array.isArray(content)) {
+    return content.map((block) =>
+      block !== null &&
+      typeof block === "object" &&
+      block.type === "text" &&
+      typeof block.text === "string"
+        ? { ...block, text: stripAgentTrailer(block.text) }
+        : block,
+    );
+  }
+  return content;
+}
+
 export function toolUpdateFromToolResult(
   toolResult:
     | ToolResultBlockParam
@@ -500,6 +585,7 @@ export function toolUpdateFromToolResult(
     | BetaToolSearchToolResultBlockParam,
   toolUse: any | undefined,
   supportsTerminalOutput: boolean = false,
+  toolUseResult?: unknown,
 ): ToolUpdate {
   if (
     "is_error" in toolResult &&
@@ -512,8 +598,63 @@ export function toolUpdateFromToolResult(
     return toAcpContentUpdate(toolResult.content, true);
   }
 
+  // Shared raw-text fallback: renders the tool_result content the model saw.
+  // The structured cases below fall back to this when `tool_use_result` is
+  // absent or fails its shape guard (older CLIs, replayed sessions).
+  const rawContentUpdate = () =>
+    toAcpContentUpdate(toolResult.content, "is_error" in toolResult ? toolResult.is_error : false);
+
   switch (toolUse?.name) {
-    case "Read":
+    case "Read": {
+      // The raw tool_result text is the model-facing view: line-numbered
+      // content plus any appended <system-reminder> blocks (malicious-code
+      // checks, memory staleness notes, …) that clients shouldn't see. The
+      // structured FileReadOutput carries the clean content — rebuild the
+      // line-numbered view from it. Non-text variants (image/notebook/pdf)
+      // fall back to the raw content blocks, which already render fine.
+      const structuredRead = structuredResult<FileReadOutput>(toolUseResult);
+      if (
+        structuredRead?.type === "text" &&
+        typeof structuredRead.file?.content === "string" &&
+        // An empty file has nothing to line-number; keep the raw view (the
+        // model-facing "file is empty" note) rather than a phantom blank line.
+        structuredRead.file.content.length > 0
+      ) {
+        // startLine is typed non-optional but defended anyway; a Read's
+        // `offset` input is the same 1-based starting line, so it beats a
+        // blind 1 when an emitter omits the field.
+        const startLine =
+          structuredRead.file.startLine ??
+          (toolUse.input as FileReadInput | undefined)?.offset ??
+          1;
+        // A trailing newline is a line terminator, not an extra line — don't
+        // number a phantom empty line after it.
+        let numbered = structuredRead.file.content
+          .replace(/\n$/, "")
+          .split("\n")
+          .map((line, i) => `${startLine + i}\t${line}`)
+          .join("\n");
+        // The model-facing truncation banner doesn't survive reconstruction
+        // from file.content (the SDK flag exists for exactly this case) —
+        // re-establish it so a partial first page doesn't read as the whole
+        // file.
+        if (structuredRead.file.truncatedByTokenCap) {
+          const { numLines, totalLines } = structuredRead.file;
+          const detail =
+            typeof numLines === "number" && typeof totalLines === "number"
+              ? `: showing ${numLines} of ${totalLines} lines`
+              : "";
+          numbered += `\n[File truncated${detail}]`;
+        }
+        return {
+          content: [
+            {
+              type: "content",
+              content: { type: "text", text: markdownEscape(numbered) },
+            },
+          ],
+        };
+      }
       if (Array.isArray(toolResult.content) && toolResult.content.length > 0) {
         return {
           content: toolResult.content.map((content: any) => ({
@@ -541,6 +682,7 @@ export function toolUpdateFromToolResult(
         };
       }
       return {};
+    }
 
     case "Bash": {
       const result = toolResult.content;
@@ -548,15 +690,57 @@ export function toolUpdateFromToolResult(
       const isError = "is_error" in toolResult && toolResult.is_error;
 
       // Extract output and exit code from either format:
-      // 1. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
-      // 2. Plain string content from a regular tool_result
-      // 3. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
+      // 1. The structured BashOutput (message-level tool_use_result): its
+      //    stdout/stderr exclude the model-directed suffixes the raw text
+      //    carries (stale-read hints, gh rate-limit hints, the
+      //    persisted-output wrapper for too-large outputs — the interruption
+      //    and truncation facts those carried are re-established from the
+      //    structured flags below). Skipped for image output (the raw content
+      //    array carries the actual image blocks) and backgrounded commands
+      //    (the raw text carries the background-task notice; structured
+      //    stdout may be empty).
+      // 2. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
+      // 3. Plain string content from a regular tool_result
+      // 4. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
       //    or [{ type: "image", source: {...} }] when the local Bash tool
       //    produces an image, e.g. piping a base64 data URI)
       let output = "";
       let exitCode = isError ? 1 : 0;
 
+      const structuredBash = structuredResult<BashOutput>(toolUseResult);
       if (
+        structuredBash &&
+        typeof structuredBash.stdout === "string" &&
+        typeof structuredBash.stderr === "string" &&
+        !structuredBash.isImage &&
+        structuredBash.backgroundTaskId === undefined
+      ) {
+        output = [structuredBash.stdout, structuredBash.stderr].filter(Boolean).join("\n");
+        // Two raw-text notices don't survive the structured stdout/stderr —
+        // re-establish them so the client isn't shown a clean-looking result:
+        // the CLI appends its abort marker only to the model-facing text, and
+        // an aborted command isn't a success, so synthesize a failing exit
+        // code when the result wasn't already an error.
+        if (structuredBash.interrupted) {
+          output = [output, "[Command was aborted before completion]"].filter(Boolean).join("\n");
+          exitCode = 1;
+        }
+        // Structured stdout is clipped (~30k chars) when the full output was
+        // persisted to disk; without this note the clip is silent and the
+        // path to the full output is lost.
+        if (typeof structuredBash.persistedOutputPath === "string") {
+          const size =
+            typeof structuredBash.persistedOutputSize === "number"
+              ? ` (${structuredBash.persistedOutputSize} bytes total)`
+              : "";
+          output = [
+            output,
+            `[Output truncated${size}: full output saved to ${structuredBash.persistedOutputPath}]`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+      } else if (
         result &&
         typeof result === "object" &&
         "type" in result &&
@@ -619,6 +803,45 @@ export function toolUpdateFromToolResult(
       return {};
     }
 
+    case "Agent":
+    case "Task": {
+      // The raw tool_result text ends with a model-directed trailer (an
+      // `agentId: … (use SendMessage …)` line plus a `<usage>` totals block)
+      // that ACP clients shouldn't see. The message-level `tool_use_result`
+      // carries the structured AgentOutput whose `content` is the subagent's
+      // report without the trailer — render from it when present (per the SDK
+      // 0.3.207 guidance) and fall back to the raw text otherwise (older CLIs,
+      // replayed sessions).
+      // Narrowed to the full union, not the completed variant — the status
+      // check below is what discriminates it, and pre-narrowing would let
+      // future field reads typecheck against a variant the runtime value may
+      // not be.
+      const structured = structuredResult<AgentOutput>(toolUseResult);
+      if (
+        structured?.status === "completed" &&
+        Array.isArray(structured.content) &&
+        // A completed subagent can end with zero text blocks; an empty
+        // structured render would beat the raw fallback for no benefit.
+        structured.content.length > 0
+      ) {
+        return toAcpContentUpdate(
+          structured.content,
+          "is_error" in toolResult ? toolResult.is_error : false,
+        );
+      }
+      // No structured report to render from (replayed sessions —
+      // getSessionMessages doesn't expose the transcript's toolUseResult —
+      // and older CLIs). The SDK advises rendering from tool_use_result
+      // instead of parsing the text, but with no structured value the
+      // tail-anchored strip is the only cleanup available; if the trailer
+      // format changes it simply stops matching and the full raw text
+      // renders, no worse than before.
+      return toAcpContentUpdate(
+        stripAgentTrailerFromContent(toolResult.content),
+        "is_error" in toolResult ? toolResult.is_error : false,
+      );
+    }
+
     case "Edit": // Edit is handled in hooks
     case "Write": {
       return {};
@@ -628,13 +851,52 @@ export function toolUpdateFromToolResult(
       return { title: "Exited Plan Mode" };
     }
 
+    case "WebSearch": {
+      // The raw tool_result text is a model-directed dump ("Web search
+      // results for query: …\n\nLinks: [{…json…}]"). The structured
+      // WebSearchOutput carries the hits — render them the way server-side
+      // web_search_result blocks render ("Title (url)").
+      const structuredSearch = structuredResult<WebSearchOutput>(toolUseResult);
+      if (structuredSearch && Array.isArray(structuredSearch.results)) {
+        const lines = structuredSearch.results.flatMap((entry) =>
+          typeof entry === "string"
+            ? [entry]
+            : Array.isArray(entry?.content)
+              ? // tool_use_result arrives untyped across CLI version skew —
+                // skip off-spec hits rather than rendering
+                // "undefined (undefined)" lines.
+                entry.content.flatMap((hit) =>
+                  typeof hit?.title === "string" && typeof hit?.url === "string"
+                    ? [formatWebSearchHit(hit)]
+                    : [],
+                )
+              : [],
+        );
+        if (lines.length > 0) {
+          return {
+            content: [
+              {
+                type: "content",
+                content: { type: "text", text: lines.join("\n") },
+              },
+            ],
+          };
+        }
+      }
+      return rawContentUpdate();
+    }
+
     default: {
-      return toAcpContentUpdate(
-        toolResult.content,
-        "is_error" in toolResult ? toolResult.is_error : false,
-      );
+      return rawContentUpdate();
     }
   }
+}
+
+/** One display format for a web-search hit, shared by the structured
+ *  WebSearchOutput render and the server-side `web_search_result` block so
+ *  the two paths can't drift. */
+function formatWebSearchHit(hit: { title: string; url: string }): string {
+  return `${hit.title} (${hit.url})`;
 }
 
 function toAcpContentUpdate(
@@ -711,7 +973,7 @@ function toAcpContentBlock(content: ToolResultContent, isError: boolean): Conten
         `Error: ${content.error_code}${content.error_message ? ` - ${content.error_message}` : ""}`,
       );
     case "web_search_result":
-      return wrapText(`${content.title} (${content.url})`);
+      return wrapText(formatWebSearchHit(content));
     case "web_search_tool_result_error":
       return wrapText(`Error: ${content.error_code}`);
     case "web_fetch_result":
@@ -954,12 +1216,7 @@ export const registerHookCallback = (
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
-  (
-    logger: Logger = console,
-    options?: {
-      onEnterPlanMode?: () => Promise<void>;
-    },
-  ): HookCallback =>
+  (options?: { onEnterPlanMode?: () => Promise<void> }): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
@@ -971,11 +1228,8 @@ export const createPostToolUseHook =
         const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
         if (onPostToolUseHook) {
           await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
-          delete toolUseCallbacks[toolUseID]; // Cleanup after execution
-        } else {
-          logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
-          delete toolUseCallbacks[toolUseID];
         }
+        delete toolUseCallbacks[toolUseID]; // Cleanup after execution
       }
     }
     return { continue: true };

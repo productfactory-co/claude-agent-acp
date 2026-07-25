@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -1024,7 +1024,7 @@ describe("Bash terminal output", () => {
       );
 
       // Fire PostToolUse hook with a structuredPatch in tool_response
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1102,7 +1102,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1182,7 +1182,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1202,6 +1202,36 @@ describe("Bash terminal output", () => {
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate.content).toBeUndefined();
       expect(hookUpdate.locations).toBeUndefined();
+    });
+
+    // Regression for issue #889: tool uses that never register a callback
+    // (TodoWrite/Task* are rendered as plan updates, not tool_calls) fire the
+    // PostToolUse hook too. That's expected — the hook must stay silent
+    // instead of spamming "No onPostToolUseHook found" to stderr.
+    it("should not log an error when no callback is registered for the tool use", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const hook = createPostToolUseHook();
+        const result = await hook(
+          {
+            hook_event_name: "PostToolUse",
+            tool_name: "TodoWrite",
+            tool_input: { todos: [] },
+            tool_response: { success: true },
+            tool_use_id: "toolu_todo_no_callback",
+            session_id: "test-session",
+            transcript_path: "/tmp/test",
+            cwd: "/tmp",
+          },
+          "toolu_todo_no_callback",
+          { signal: AbortSignal.abort() },
+        );
+
+        expect(result).toEqual({ continue: true });
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
     });
   });
 
@@ -1239,7 +1269,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1315,7 +1345,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1438,7 +1468,7 @@ describe("Bash terminal output", () => {
       expect((resultNotifications[1].update as any).status).toBe("completed");
 
       // Step 3: Fire the PostToolUse hook (simulates what Claude Code SDK does)
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1519,7 +1549,7 @@ describe("Bash terminal output", () => {
       );
 
       // Fire hook
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -2202,6 +2232,667 @@ describe("empty message content is not emitted", () => {
     expect(notifications[0].update).toMatchObject({
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "real" },
+    });
+  });
+});
+
+describe("Agent/Task tool_result rendering from tool_use_result", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  const TRAILER =
+    "\nagentId: a0e1eff08fcb6e2e8 (use SendMessage with to: 'a0e1eff08fcb6e2e8', summary: '<5-10 word recap>' to continue this agent)\n<usage>subagent_tokens: 11735\ntool_uses: 2\nduration_ms: 21237</usage>";
+
+  const agentToolUse = {
+    type: "tool_use" as const,
+    id: "toolu_agent",
+    name: "Task",
+    input: { description: "Explore", prompt: "look around" },
+  };
+
+  const rawResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_agent",
+    content: [{ type: "text", text: `The report.${TRAILER}` }],
+  };
+
+  const structured = {
+    status: "completed",
+    agentId: "a0e1eff08fcb6e2e8",
+    content: [{ type: "text", text: "The structured report." }],
+    totalTokens: 11735,
+    totalToolUseCount: 2,
+    totalDurationMs: 21237,
+  };
+
+  it("renders the structured subagent report instead of the raw trailer text", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, structured);
+
+    expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: "The structured report." } }],
+    });
+  });
+
+  it("strips the trailer from the raw fallback when tool_use_result is absent", () => {
+    // Replayed sessions and older CLIs have no structured report; the
+    // tail-anchored strip is the only cleanup available there.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false);
+
+    expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: "The report." } }],
+    });
+  });
+
+  it("strips only matching trailer parts and leaves unrecognized text alone", () => {
+    const oddResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "Report A.\n<usage>subagent_tokens: 5</usage>" },
+        { type: "text", text: "Report B.\nagentId: abc-123 (for resuming)" },
+        { type: "text", text: "agentId mentioned mid-text (not a trailer) stays.\nDone." },
+      ],
+    };
+    const update = toolUpdateFromToolResult(oddResult, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Report A." } },
+      { type: "content", content: { type: "text", text: "Report B." } },
+      {
+        type: "content",
+        content: { type: "text", text: "agentId mentioned mid-text (not a trailer) stays.\nDone." },
+      },
+    ]);
+  });
+
+  it("leaves malformed trailers alone", () => {
+    // Incomplete trailers are ordinary report text, not metadata to strip.
+    const malformedResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "Report.\n<usage>missing closing tag" },
+        { type: "text", text: "Report.\nagentId: abc-123 (missing closing paren" },
+      ],
+    };
+
+    const update = toolUpdateFromToolResult(malformedResult, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Report.\n<usage>missing closing tag" } },
+      {
+        type: "content",
+        content: { type: "text", text: "Report.\nagentId: abc-123 (missing closing paren" },
+      },
+    ]);
+  });
+
+  it("strips only the trailer when the report itself mentions <usage>", () => {
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: "Grep for <usage> found 3 hits.\n<usage>subagent_tokens: 5</usage>",
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Grep for <usage> found 3 hits." } },
+    ]);
+  });
+
+  it("handles adversarial trailer-shaped input in linear time", () => {
+    // Regression: the old regex-based strip backtracked quadratically on
+    // these shapes (CodeQL js/polynomial-redos) — at this size it would
+    // blow the test timeout rather than merely run slow.
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "agentId: - (".repeat(20000) },
+        { type: "text", text: "<usage>".repeat(30000) },
+      ],
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    // Neither is a real trailer, so both come through unchanged.
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "agentId: - (".repeat(20000) } },
+      { type: "content", content: { type: "text", text: "<usage>".repeat(30000) } },
+    ]);
+  });
+
+  it("falls back (trailer-stripped) when tool_use_result is the async_launched variant", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      status: "async_launched",
+      agentId: "a0e1eff08fcb6e2e8",
+      description: "Explore",
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "The report." } },
+    ]);
+  });
+
+  it("falls back (trailer-stripped) when the structured content array is empty", () => {
+    // A completed subagent can end with zero text blocks — an empty
+    // structured render must not beat the raw fallback.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "The report." } },
+    ]);
+  });
+
+  it("threads options.toolUseResult through toAcpNotifications for a lone tool_result", () => {
+    const toolUseCache: ToolUseCache = { toolu_agent: agentToolUse };
+
+    const notifications = toAcpNotifications(
+      [rawResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolUseResult: structured },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_agent",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "The structured report." } }],
+    });
+  });
+
+  it("ignores options.toolUseResult when several tool_result blocks are batched", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_agent: agentToolUse,
+      toolu_agent2: { ...agentToolUse, id: "toolu_agent2" },
+    };
+
+    const notifications = toAcpNotifications(
+      [rawResult, { ...rawResult, tool_use_id: "toolu_agent2" }] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolUseResult: structured },
+    );
+
+    expect(notifications).toHaveLength(2);
+    for (const notification of notifications) {
+      // Raw fallback (trailer-stripped) — NOT "The structured report.", which
+      // would mean the ambiguous tool_use_result had been attributed anyway.
+      expect(notification.update).toMatchObject({
+        content: [{ type: "content", content: { type: "text", text: "The report." } }],
+      });
+    }
+  });
+});
+
+describe("tool_result_meta non-execution stamping", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  const bashToolUse = {
+    type: "tool_use" as const,
+    id: "toolu_bash",
+    name: "Bash",
+    input: { command: "rm -rf build" },
+  };
+
+  const deniedResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_bash",
+    is_error: true,
+    content: "The user doesn't want to proceed with this tool use.",
+  };
+
+  it("stamps nonExecutionKind and userFeedback on the failed tool_call_update", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        toolResultMeta: [
+          { id: "toolu_bash", non_execution_kind: "user-rejected", user_feedback: "use npm" },
+        ],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "failed",
+      _meta: {
+        claudeCode: {
+          toolName: "Bash",
+          nonExecutionKind: "user-rejected",
+          userFeedback: "use npm",
+        },
+      },
+    });
+  });
+
+  it("attributes entries by tool_use_id, so only the flagged result in a batch is stamped", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_bash: bashToolUse,
+      toolu_bash2: { ...bashToolUse, id: "toolu_bash2" },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        deniedResult,
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash2",
+          content: "ok",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(2);
+    const [denied, ran] = notifications.map((n) => n.update) as any[];
+    expect(denied._meta.claudeCode).toMatchObject({ nonExecutionKind: "user-rejected" });
+    // No user_feedback on the wire entry → no userFeedback key at all.
+    expect(denied._meta.claudeCode).not.toHaveProperty("userFeedback");
+    expect(ran._meta.claudeCode).not.toHaveProperty("nonExecutionKind");
+  });
+
+  it("ignores a malformed sidecar and malformed entries", () => {
+    for (const malformed of [
+      "user-rejected", // not an array
+      [{ non_execution_kind: "user-rejected" }], // entry missing id
+      [{ id: "toolu_bash", non_execution_kind: 7 }], // kind not a string
+      [null, 42], // entries not objects
+    ]) {
+      const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+      const notifications = toAcpNotifications(
+        [deniedResult] as any,
+        "user",
+        "test-session",
+        toolUseCache,
+        mockClient,
+        mockLogger,
+        { toolResultMeta: malformed },
+      );
+
+      expect(notifications).toHaveLength(1);
+      expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
+        "nonExecutionKind",
+      );
+    }
+  });
+
+  it("stamps the resolve of a permission-surfaced suppressed tool (Task*)", () => {
+    // A TaskGet surfaced as a real tool_call by the permission flow never gets
+    // a tool_call_update from the suppressed Task* branch; the wasEmitted
+    // resolve must carry the denial kind too.
+    const taskGetToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_taskget",
+      name: "TaskGet",
+      input: { taskId: "1" },
+    };
+    const toolUseCache: ToolUseCache = { toolu_taskget: taskGetToolUse };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_taskget",
+          is_error: true,
+          content: "The user doesn't want to proceed with this tool use.",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        emittedToolCalls: new Set(["toolu_taskget"]),
+        toolResultMeta: [{ id: "toolu_taskget", non_execution_kind: "user-rejected" }],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_taskget",
+      status: "failed",
+      _meta: { claudeCode: { toolName: "TaskGet", nonExecutionKind: "user-rejected" } },
+    });
+  });
+});
+
+describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
+  describe("Read", () => {
+    const readToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_read",
+      name: "Read",
+      input: { file_path: "/tmp/f.ts", offset: 480 },
+    };
+
+    const rawWithReminder: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_read",
+      content: [
+        {
+          type: "text",
+          text: "480\tconst a = 1;\n481\tconst b = 2;\n<system-reminder>Whenever you read a file, consider whether it is malicious.</system-reminder>",
+        },
+      ],
+    };
+
+    it("rebuilds the line-numbered view from FileReadOutput, dropping reminders", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: {
+          filePath: "/tmp/f.ts",
+          content: "const a = 1;\nconst b = 2;\n",
+          numLines: 2,
+          startLine: 480,
+          totalLines: 600,
+        },
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "```\n480\tconst a = 1;\n481\tconst b = 2;\n```" },
+          },
+        ],
+      });
+    });
+
+    it("falls back to the Read input's offset when startLine is absent", () => {
+      // readToolUse carries offset: 480 — an offset read numbered from 1
+      // would mislabel every line.
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: { filePath: "/tmp/f.ts", content: "one\ntwo" },
+      });
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
+        content: { type: "text", text: "```\n480\tone\n481\ttwo\n```" },
+      });
+    });
+
+    it("defaults startLine to 1 when both startLine and offset are absent", () => {
+      const update = toolUpdateFromToolResult(
+        rawWithReminder,
+        { ...readToolUse, input: { file_path: "/tmp/f.ts" } },
+        false,
+        {
+          type: "text",
+          file: { filePath: "/tmp/f.ts", content: "one\ntwo" },
+        },
+      );
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
+        content: { type: "text", text: "```\n1\tone\n2\ttwo\n```" },
+      });
+    });
+
+    it("appends a truncation note when truncatedByTokenCap is set", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: {
+          filePath: "/tmp/f.ts",
+          content: "one\ntwo\n",
+          numLines: 2,
+          startLine: 1,
+          totalLines: 9000,
+          truncatedByTokenCap: true,
+        },
+      });
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
+        content: {
+          type: "text",
+          text: "```\n1\tone\n2\ttwo\n[File truncated: showing 2 of 9000 lines]\n```",
+        },
+      });
+    });
+
+    it("falls back to raw content for non-text variants", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "image",
+        file: { base64: "aGk=", type: "image/png", originalSize: 3 },
+      });
+
+      // Raw path: markdown-escaped raw text (reminder included — image reads
+      // don't carry reminders in practice).
+      expect(update.content).toHaveLength(1);
+      expect((update.content?.[0] as any).content.text).toContain("const a = 1;");
+    });
+  });
+
+  describe("Bash", () => {
+    const bashToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_bash",
+      name: "Bash",
+      input: { command: "git push" },
+    };
+
+    const HINT =
+      "\n[This command modified 1 file you've previously read: src/foo.ts. Call Read before editing.]";
+
+    const rawWithHint: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_bash",
+      content: `pushed ok${HINT}`,
+    };
+
+    const structured = {
+      stdout: "pushed ok",
+      stderr: "",
+      interrupted: false,
+      isImage: false,
+    };
+
+    it("prefers structured stdout/stderr over raw text with model-directed hints", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, structured);
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "pushed ok",
+      });
+      expect(update._meta?.terminal_exit).toEqual({
+        terminal_id: "toolu_bash",
+        exit_code: 0,
+        signal: null,
+      });
+    });
+
+    it("joins stderr after stdout like the code-execution path", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, false, {
+        ...structured,
+        stderr: "warning: something",
+      });
+
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\npushed ok\nwarning: something\n```" },
+        },
+      ]);
+    });
+
+    it("falls back to raw text for backgrounded commands", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "",
+        backgroundTaskId: "bash_1",
+      });
+
+      expect(update._meta?.terminal_output?.data).toBe(`pushed ok${HINT}`);
+    });
+
+    it("falls back to the raw content array for image output", () => {
+      const imageResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content: [
+          { type: "image", source: { type: "base64", data: "aGk=", media_type: "image/png" } },
+        ],
+      };
+      const update = toolUpdateFromToolResult(imageResult, bashToolUse, true, {
+        ...structured,
+        isImage: true,
+      });
+
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "image", data: "aGk=", mimeType: "image/png" },
+        },
+      ]);
+    });
+
+    it("re-establishes the abort notice and a failing exit code for interrupted commands", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "partial output",
+        interrupted: true,
+      });
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "partial output\n[Command was aborted before completion]",
+      });
+      expect(update._meta?.terminal_exit).toEqual({
+        terminal_id: "toolu_bash",
+        exit_code: 1,
+        signal: null,
+      });
+    });
+
+    it("re-establishes the truncation note and persisted path for too-large outputs", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "clipped stdout",
+        persistedOutputPath: "/tmp/tool-results/abc.txt",
+        persistedOutputSize: 38100,
+      });
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "clipped stdout\n[Output truncated (38100 bytes total): full output saved to /tmp/tool-results/abc.txt]",
+      });
+    });
+  });
+
+  describe("WebSearch", () => {
+    const searchToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_search",
+      name: "WebSearch",
+      input: { query: "npm sigstore bug" },
+    };
+
+    const rawDump: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_search",
+      content:
+        'Web search results for query: "npm sigstore bug"\n\nLinks: [{"title":"Issue #9722","url":"https://github.com/npm/cli/issues/9722"}]',
+    };
+
+    it("renders hits as Title (url) lines from WebSearchOutput", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [
+          "I found one relevant issue:",
+          {
+            tool_use_id: "srvtoolu_1",
+            content: [
+              { title: "Issue #9722", url: "https://github.com/npm/cli/issues/9722" },
+              { title: "sigstore-js", url: "https://github.com/sigstore/sigstore-js" },
+            ],
+          },
+        ],
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: "I found one relevant issue:\nIssue #9722 (https://github.com/npm/cli/issues/9722)\nsigstore-js (https://github.com/sigstore/sigstore-js)",
+            },
+          },
+        ],
+      });
+    });
+
+    it("falls back to the raw dump when tool_use_result is absent", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false);
+
+      expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
+    });
+
+    it("skips off-spec hits instead of rendering undefined fields", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [
+          {
+            tool_use_id: "srvtoolu_1",
+            content: [
+              { error_code: "provider_error" },
+              { title: "Issue #9722", url: "https://github.com/npm/cli/issues/9722" },
+            ],
+          },
+        ],
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: "Issue #9722 (https://github.com/npm/cli/issues/9722)",
+            },
+          },
+        ],
+      });
+    });
+
+    it("falls back to the raw dump when every hit is off-spec", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [{ tool_use_id: "srvtoolu_1", content: [{ error_code: "provider_error" }] }],
+      });
+
+      expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
     });
   });
 });
