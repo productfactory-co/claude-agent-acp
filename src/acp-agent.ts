@@ -7294,16 +7294,22 @@ export function streamEventToAcpNotifications(
   // below instead of replacing them.
   const factoryUpdates: SessionNotification[] = [];
   if (process.env.FACTORY_STREAM_TOOL_INPUT === "1") {
-    if (
-      event.type === "content_block_start" &&
-      event.content_block.type === "tool_use" &&
-      FACTORY_FILE_TOOLS.has(event.content_block.name)
-    ) {
-      factoryToolInputLane(toolUseCache, streamKey, true)?.set(event.index, {
-        id: event.content_block.id,
-        name: event.content_block.name,
-        seq: 0,
-      });
+    if (event.type === "content_block_start") {
+      // A new block owns this lane/index even if a truncated prior message
+      // never delivered its stop/boundary event. Clear stale file-tool state
+      // before deciding whether the new block itself should be streamed.
+      factoryToolInputLane(toolUseCache, streamKey, false)?.delete(event.index);
+      pruneFactoryToolInputLane(toolUseCache, streamKey);
+      if (
+        event.content_block.type === "tool_use" &&
+        FACTORY_FILE_TOOLS.has(event.content_block.name)
+      ) {
+        factoryToolInputLane(toolUseCache, streamKey, true)?.set(event.index, {
+          id: event.content_block.id,
+          name: event.content_block.name,
+          seq: 0,
+        });
+      }
     } else if (event.type === "content_block_delta" && event.delta.type === "input_json_delta") {
       const entry = factoryToolInputLane(toolUseCache, streamKey, false)?.get(event.index);
       if (

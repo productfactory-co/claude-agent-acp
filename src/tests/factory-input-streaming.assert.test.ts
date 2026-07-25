@@ -114,8 +114,9 @@ describe("Product Factory adapter: partial tool-input streaming", () => {
     expect(inputDelta(cache, '{"x":1', 3)).toHaveLength(0);
   });
 
-  it("does not track non-file tools", () => {
+  it("does not track non-file tools or retain stale state at their block index", () => {
     const cache: Cache = {};
+    startWrite(cache);
     emit(cache, {
       type: "content_block_start",
       index: 0,
