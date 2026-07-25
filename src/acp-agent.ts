@@ -7229,6 +7229,42 @@ export function toAcpNotifications(
   return output;
 }
 
+type FactoryStreamedToolInput = {
+  id: string;
+  name: string;
+  seq: number;
+};
+
+type FactoryStreamedToolInputLanes = Map<string, Map<number, FactoryStreamedToolInput>>;
+
+const FACTORY_FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+const factoryStreamedToolInputs = new WeakMap<ToolUseCache, FactoryStreamedToolInputLanes>();
+
+function factoryToolInputLane(
+  toolUseCache: ToolUseCache,
+  streamKey: string,
+  create: boolean,
+): Map<number, FactoryStreamedToolInput> | undefined {
+  let lanes = factoryStreamedToolInputs.get(toolUseCache);
+  if (!lanes && create) {
+    lanes = new Map();
+    factoryStreamedToolInputs.set(toolUseCache, lanes);
+  }
+  let lane = lanes?.get(streamKey);
+  if (!lane && create) {
+    lane = new Map();
+    lanes?.set(streamKey, lane);
+  }
+  return lane;
+}
+
+function pruneFactoryToolInputLane(toolUseCache: ToolUseCache, streamKey: string): void {
+  const lanes = factoryStreamedToolInputs.get(toolUseCache);
+  const lane = lanes?.get(streamKey);
+  if (lane?.size === 0) lanes?.delete(streamKey);
+  if (lanes?.size === 0) factoryStreamedToolInputs.delete(toolUseCache);
+}
+
 export function streamEventToAcpNotifications(
   message: SDKPartialAssistantMessage,
   sessionId: string,
@@ -7245,6 +7281,7 @@ export function streamEventToAcpNotifications(
   },
 ): SessionNotification[] {
   const event = message.event;
+  const streamKey = message.parent_tool_use_id ?? "";
   // ── FACTORY PATCH (input-streaming, env-gated): relay partial tool input ──
   // Upstream refines completed top-level JSON fields, but the large content
   // field of Write/Edit/MultiEdit still only surfaces when the tool call
@@ -7257,53 +7294,55 @@ export function streamEventToAcpNotifications(
   // below instead of replacing them.
   const factoryUpdates: SessionNotification[] = [];
   if (process.env.FACTORY_STREAM_TOOL_INPUT === "1") {
-    type FactoryBlockIndex = Record<number, { id: string; name: string; seq: number }>;
-    const FACTORY_FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
-    const cache = toolUseCache as ToolUseCache & {
-      __factoryBlockIndex?: FactoryBlockIndex;
-    };
-    const factoryIdx = (cache.__factoryBlockIndex ??= {});
     if (
       event.type === "content_block_start" &&
       event.content_block.type === "tool_use" &&
       FACTORY_FILE_TOOLS.has(event.content_block.name)
     ) {
-      factoryIdx[event.index] = {
+      factoryToolInputLane(toolUseCache, streamKey, true)?.set(event.index, {
         id: event.content_block.id,
         name: event.content_block.name,
         seq: 0,
-      };
+      });
     } else if (event.type === "content_block_delta" && event.delta.type === "input_json_delta") {
-      const entry = factoryIdx[event.index];
+      const entry = factoryToolInputLane(toolUseCache, streamKey, false)?.get(event.index);
       if (
         entry &&
         typeof event.delta.partial_json === "string" &&
         event.delta.partial_json.length > 0
       ) {
         entry.seq += 1;
-        factoryUpdates.push({
-          sessionId,
-          update: {
-            sessionUpdate: "tool_call_update",
-            toolCallId: entry.id,
-            _meta: {
-              claudeCode: {
-                toolName: entry.name,
-                inputJsonDelta: {
-                  seq: entry.seq,
-                  partialJson: event.delta.partial_json,
-                },
+        const update: SessionNotification["update"] = {
+          sessionUpdate: "tool_call_update",
+          toolCallId: entry.id,
+          _meta: {
+            claudeCode: {
+              toolName: entry.name,
+              inputJsonDelta: {
+                seq: entry.seq,
+                partialJson: event.delta.partial_json,
               },
+              ...(message.parent_tool_use_id
+                ? { parentToolUseId: message.parent_tool_use_id }
+                : {}),
             },
           },
+        };
+        applyMessageId(update, options?.messageId);
+        factoryUpdates.push({
+          sessionId,
+          update,
         });
       }
     } else if (event.type === "content_block_stop") {
-      delete factoryIdx[event.index];
+      factoryToolInputLane(toolUseCache, streamKey, false)?.delete(event.index);
+      pruneFactoryToolInputLane(toolUseCache, streamKey);
+    } else if (event.type === "message_start" || event.type === "message_stop") {
+      factoryStreamedToolInputs.get(toolUseCache)?.delete(streamKey);
+      pruneFactoryToolInputLane(toolUseCache, streamKey);
     }
   }
   // ── END FACTORY PATCH ──
-  const streamKey = message.parent_tool_use_id ?? "";
   const streamedToolInputs = options?.streamedToolInputs;
   const forwardedOptions = {
     clientCapabilities: options?.clientCapabilities,

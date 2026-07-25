@@ -16,11 +16,11 @@ const noopLogger = {
 };
 const noopClient = {} as Parameters<typeof streamEventToAcpNotifications>[3];
 
-function streamEvent(event: Record<string, unknown>) {
+function streamEvent(event: Record<string, unknown>, parentToolUseId: string | null = null) {
   return {
     type: "stream_event",
     event,
-    parent_tool_use_id: null,
+    parent_tool_use_id: parentToolUseId,
   } as unknown as Parameters<typeof streamEventToAcpNotifications>[0];
 }
 
@@ -28,9 +28,10 @@ function emit(
   cache: Cache,
   event: Record<string, unknown>,
   options?: StreamOptions,
+  parentToolUseId: string | null = null,
 ): Array<{ update: Record<string, unknown> }> {
   return streamEventToAcpNotifications(
-    streamEvent(event),
+    streamEvent(event, parentToolUseId),
     "sess-1",
     cache,
     noopClient,
@@ -63,7 +64,7 @@ function inputDelta(cache: Cache, partial: string, index = 0, options?: StreamOp
   );
 }
 
-describe("vendored adapter: partial tool-input streaming (FACTORY PATCH)", () => {
+describe("Product Factory adapter: partial tool-input streaming", () => {
   beforeEach(() => {
     process.env.FACTORY_STREAM_TOOL_INPUT = "1";
   });
@@ -145,15 +146,61 @@ describe("vendored adapter: partial tool-input streaming (FACTORY PATCH)", () =>
     });
   });
 
-  it("reserved cache key does not disturb upstream tool_call emission for the same block", () => {
+  it("does not contaminate upstream's tool-use cache", () => {
     const cache: Cache = {};
     const started = startWrite(cache);
     // Upstream still emits the pending tool_call on content_block_start.
     expect(
       started.some((n) => (n.update as { sessionUpdate?: string }).sessionUpdate === "tool_call"),
     ).toBe(true);
-    // And the reserved key never leaks a fake tool entry: only the real id plus marker.
-    expect(Object.keys(cache).sort()).toEqual(["__factoryBlockIndex", "toolu_write_1"]);
+    expect(Object.keys(cache)).toEqual(["toolu_write_1"]);
+  });
+
+  it("isolates matching block indexes across main and subagent streams", () => {
+    const cache: Cache = {};
+    startWrite(cache, 0, "toolu_main");
+    emit(
+      cache,
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_sub", name: "Write", input: {} },
+      },
+      undefined,
+      "toolu_parent_task",
+    );
+
+    const mainFirst = inputDelta(cache, '{"file_path":"main.ts","content":"a');
+    const subFirst = emit(
+      cache,
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"file_path":"sub.ts","content":"b' },
+      },
+      undefined,
+      "toolu_parent_task",
+    );
+
+    expect(mainFirst[0]?.update).toMatchObject({
+      toolCallId: "toolu_main",
+      _meta: { claudeCode: { inputJsonDelta: { seq: 1 } } },
+    });
+    expect(subFirst[0]?.update).toMatchObject({
+      toolCallId: "toolu_sub",
+      _meta: {
+        claudeCode: {
+          parentToolUseId: "toolu_parent_task",
+          inputJsonDelta: { seq: 1 },
+        },
+      },
+    });
+
+    emit(cache, { type: "content_block_stop", index: 0 }, undefined, "toolu_parent_task");
+    expect(inputDelta(cache, '"tail"')[0]?.update).toMatchObject({
+      toolCallId: "toolu_main",
+      _meta: { claudeCode: { inputJsonDelta: { seq: 2 } } },
+    });
   });
 
   it("composes raw deltas with upstream completed-field refinements", () => {
