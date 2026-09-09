@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -15,14 +18,44 @@ import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
   createTaskHook,
+  clearHookCallbacks,
+  registerHookCallback,
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
+  applyTaskList,
   applyTaskUpdate,
   parseTaskCreateOutput,
+  parseTaskListOutput,
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
+
+describe("PostToolUse callback ownership", () => {
+  it("clears only callbacks owned by the cancelled session", async () => {
+    const first = vi.fn(async () => {});
+    const second = vi.fn(async () => {});
+    registerHookCallback("owned-first", { onPostToolUseHook: first }, "session-one");
+    registerHookCallback("owned-second", { onPostToolUseHook: second }, "session-two");
+
+    clearHookCallbacks("session-one");
+    const hook = createPostToolUseHook();
+    const context = { signal: new AbortController().signal };
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-first",
+      context,
+    );
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-second",
+      context,
+    );
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledOnce();
+  });
+});
 
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AcpClient;
@@ -491,6 +524,94 @@ describe("Bash terminal output", () => {
       });
     });
 
+    it("keys the terminal metas off the tool_use id, which is what was announced", () => {
+      // `toolInfoFromToolUse` announces the terminal as `toolUse.id`, so the
+      // result's metas have to use the same value for the client to match them
+      // up. A result block that disagrees (or omits `tool_use_id`) must not be
+      // allowed to retarget them.
+      const toolResult = {
+        ...makeBashResult("out", "", 0),
+        tool_use_id: "toolu_something_else",
+      };
+      const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("falls back to the result's tool_use_id when the tool_use is unavailable", () => {
+      const toolResult = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(toolResult, { name: "Bash" }, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("renders a code block instead of a dangling terminal when no id is available", () => {
+      // Previously this emitted `terminal_id: ""` for all three metas. Nothing
+      // on the client has a terminal under that id, so the output was stranded
+      // (Zed buffers output/exit for unknown terminals indefinitely) and the
+      // user saw an empty terminal. Degrade to the non-terminal rendering.
+      // `tool_use_id` is required on every result-block type, so a block without
+      // it can only arrive at runtime (an older or non-conforming emitter). The
+      // source guards for it with `"tool_use_id" in toolResult`, so exercise that
+      // path with a cast rather than pretending the type allows it.
+      const { content, type } = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(
+        { content, type } as unknown as Parameters<typeof toolUpdateFromToolResult>[0],
+        { name: "Bash" },
+        true,
+      );
+
+      expect(update._meta).toBeUndefined();
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\nout\n```" },
+        },
+      ]);
+    });
+
+    it("treats an empty tool_use id as no id and falls back to the result block", () => {
+      const toolResult = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(toolResult, { id: "", name: "Bash" }, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("renders a code block when neither id is a usable string", () => {
+      // A present-but-undefined `tool_use_id` still satisfies an `in` check, and
+      // stringifying it would key all three metas on the literal "undefined" — an
+      // id no client ever created a terminal for, so the output strands exactly as
+      // it did under the old empty-string id.
+      const toolResult = {
+        ...makeBashResult("out", "", 0),
+        tool_use_id: undefined,
+      } as unknown as Parameters<typeof toolUpdateFromToolResult>[0];
+      const update = toolUpdateFromToolResult(toolResult, { id: "", name: "Bash" }, true);
+
+      expect(update._meta).toBeUndefined();
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\nout\n```" },
+        },
+      ]);
+    });
+
     it("should include exit_code from return_code in terminal_exit", () => {
       const toolResult = makeBashResult("", "command not found", 127);
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
@@ -846,6 +967,7 @@ describe("Bash terminal output", () => {
       // terminal_info and terminal_output should NOT be on the exit notification
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_info");
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_output");
+      expect(exitUpdate).not.toHaveProperty("rawOutput");
     });
 
     it("should not include terminal _meta when client does not declare terminal_output support", () => {
@@ -868,6 +990,7 @@ describe("Bash terminal output", () => {
       expect((update as any)._meta).not.toHaveProperty("terminal_info");
       expect((update as any)._meta).not.toHaveProperty("terminal_output");
       expect((update as any)._meta).not.toHaveProperty("terminal_exit");
+      expect(update).toHaveProperty("rawOutput", bashResult);
     });
 
     it("should not include terminal _meta when _meta.terminal_output is false", () => {
@@ -1021,6 +1144,7 @@ describe("Bash terminal output", () => {
         toolUseCache,
         mockClientWithUpdate,
         mockLogger,
+        { parentToolUseId: "parent-agent-tool" },
       );
 
       // Fire PostToolUse hook with a structuredPatch in tool_response
@@ -1060,6 +1184,7 @@ describe("Bash terminal output", () => {
       expect(hookUpdates).toHaveLength(1);
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate._meta.claudeCode.toolName).toBe("Edit");
+      expect(hookUpdate._meta.claudeCode.parentToolUseId).toBe("parent-agent-tool");
       expect(hookUpdate.content).toEqual([
         {
           type: "diff",
@@ -1590,7 +1715,7 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     const info = toolInfoFromToolUse(toolUse, false);
 
     expect(info.kind).toBe("switch_mode");
-    expect(info.title).toBe("Ready to code?");
+    expect(info.title).toBe("Approve Plan");
     expect(info.content).toHaveLength(1);
     expect(info.content![0]).toEqual({
       type: "content",
@@ -1637,6 +1762,16 @@ describe("toolInfoFromToolUse - undefined input regression", () => {
     const toolUse = { name: "WebSearch", id: "toolu_ws_undef", input: undefined };
     const info = toolInfoFromToolUse(toolUse, false);
     expect(info.title).toBe("Web search");
+  });
+
+  it("shows a WebSearch query in the tool title", () => {
+    const toolUse = {
+      name: "WebSearch",
+      id: "toolu_ws_query",
+      input: { query: "Agent Client Protocol ACP specification subagents v2" },
+    };
+    const info = toolInfoFromToolUse(toolUse, false);
+    expect(info.title).toBe('Search "Agent Client Protocol ACP specification subagents v2"');
   });
 
   it("TodoWrite with undefined input should not throw", () => {
@@ -1729,6 +1864,14 @@ describe("planEntries - undefined input regression", () => {
       { content: "Task 2", status: "completed", priority: "medium" },
     ]);
   });
+
+  it("uses activeForm while a todo is in progress", () => {
+    expect(
+      planEntries({
+        todos: [{ content: "Run tests", status: "in_progress", activeForm: "Running tests" }],
+      }),
+    ).toEqual([{ content: "Running tests", status: "in_progress", priority: "medium" }]);
+  });
 });
 
 describe("toAcpNotifications - TodoWrite with undefined input regression", () => {
@@ -1796,6 +1939,20 @@ describe("parseTaskCreateOutput", () => {
     expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
   });
 
+  it("continues past unrelated JSON blocks", () => {
+    const parsed = parseTaskCreateOutput([
+      { type: "text", text: JSON.stringify({ metadata: "unrelated" }) },
+      { type: "text", text: JSON.stringify({ task: { id: "2", subject: "Y" } }) },
+    ]);
+    expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
+  });
+
+  it("parses the human-readable TaskCreate format used in session history", () => {
+    expect(parseTaskCreateOutput("Task #42 created successfully: Run tests")).toEqual({
+      task: { id: "42", subject: "Run tests" },
+    });
+  });
+
   it("returns undefined for non-JSON content", () => {
     expect(parseTaskCreateOutput("not json")).toBeUndefined();
     expect(parseTaskCreateOutput([{ type: "text", text: "not json" }])).toBeUndefined();
@@ -1830,11 +1987,15 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
 
   it("updates fields by task ID and keeps insertion order in plan entries", () => {
     const state: TaskState = new Map();
-    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskCreate(
+      state,
+      { subject: "A", description: "", activeForm: "Working on A" },
+      { task: { id: "1", subject: "A" } },
+    );
     applyTaskCreate(state, { subject: "B", description: "" }, { task: { id: "2", subject: "B" } });
     applyTaskUpdate(state, { taskId: "1", status: "in_progress" });
     expect(taskStateToPlanEntries(state)).toEqual([
-      { content: "A", status: "in_progress", priority: "medium" },
+      { content: "Working on A", status: "in_progress", priority: "medium" },
       { content: "B", status: "pending", priority: "medium" },
     ]);
   });
@@ -1863,6 +2024,84 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     // Without a subject we'd render an empty-content plan entry, so the
     // update is dropped instead of synthesizing a blank placeholder.
     expect(state.has("5")).toBe(false);
+  });
+
+  it("rebuilds task state from TaskList while preserving richer local fields", () => {
+    const state: TaskState = new Map([
+      [
+        "1",
+        {
+          subject: "Old subject",
+          status: "pending",
+          activeForm: "Running the task",
+          description: "Details",
+        },
+      ],
+      ["deleted", { subject: "Stale", status: "pending" }],
+    ]);
+    const output = parseTaskListOutput(
+      JSON.stringify({
+        tasks: [
+          { id: "1", subject: "Current subject", status: "in_progress", blockedBy: [] },
+          { id: "2", subject: "New task", status: "pending", blockedBy: [] },
+        ],
+      }),
+    );
+
+    expect(output).toBeDefined();
+    applyTaskList(state, output!);
+
+    expect([...state.entries()]).toEqual([
+      [
+        "1",
+        {
+          subject: "Current subject",
+          status: "in_progress",
+          activeForm: "Running the task",
+          description: "Details",
+        },
+      ],
+      [
+        "2",
+        {
+          subject: "New task",
+          status: "pending",
+          activeForm: undefined,
+          description: undefined,
+        },
+      ],
+    ]);
+  });
+
+  it("finds a TaskList snapshot after an unrelated JSON block", () => {
+    expect(
+      parseTaskListOutput([
+        { type: "text", text: JSON.stringify({ metadata: "unrelated" }) },
+        {
+          type: "text",
+          text: JSON.stringify({
+            tasks: [{ id: "1", subject: "Recovered", status: "pending", blockedBy: [] }],
+          }),
+        },
+      ]),
+    ).toEqual({
+      tasks: [{ id: "1", subject: "Recovered", status: "pending", blockedBy: [] }],
+    });
+  });
+
+  it("parses the human-readable TaskList format used in session history", () => {
+    expect(
+      parseTaskListOutput(
+        "#1 [in_progress] Run tests\n#2 [pending] Write release notes [blocked by #1]",
+      ),
+    ).toEqual({
+      tasks: [
+        { id: "1", subject: "Run tests", status: "in_progress", blockedBy: [] },
+        { id: "2", subject: "Write release notes", status: "pending", blockedBy: ["1"] },
+      ],
+    });
+
+    expect(parseTaskListOutput("No tasks found")).toEqual({ tasks: [] });
   });
 });
 
@@ -2024,10 +2263,9 @@ describe("toAcpNotifications - Task* tools", () => {
     });
   });
 
-  it("suppresses TaskList and TaskGet tool_result without touching task state", () => {
+  it("uses the structured TaskList result as an authoritative plan snapshot", () => {
     const toolUseCache: ToolUseCache = {
       "list-1": { type: "tool_use", id: "list-1", name: "TaskList", input: {} },
-      "get-1": { type: "tool_use", id: "get-1", name: "TaskGet", input: { taskId: "1" } },
     };
     const taskState: TaskState = new Map([
       ["1", { subject: "Existing", status: "in_progress" as const }],
@@ -2035,8 +2273,93 @@ describe("toAcpNotifications - Task* tools", () => {
 
     const notifications = toAcpNotifications(
       [
-        { type: "tool_result", tool_use_id: "list-1", content: "...", is_error: false },
-        { type: "tool_result", tool_use_id: "get-1", content: "...", is_error: false },
+        {
+          type: "tool_result",
+          tool_use_id: "list-1",
+          content: "#2 [pending] Recovered",
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        taskState,
+        toolUseResult: {
+          tasks: [{ id: "2", subject: "Recovered", status: "pending", blockedBy: [] }],
+        },
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "Recovered", status: "pending", priority: "medium" }],
+    });
+    expect([...taskState.keys()]).toEqual(["2"]);
+  });
+
+  it("does not apply a logically failed TaskUpdate", () => {
+    const toolUseCache: ToolUseCache = {
+      "update-1": {
+        type: "tool_use",
+        id: "update-1",
+        name: "TaskUpdate",
+        input: { taskId: "1", status: "completed" },
+      },
+    };
+    const taskState: TaskState = new Map([["1", { subject: "Existing", status: "pending" }]]);
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: "Task #1 not found",
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        taskState,
+        toolUseResult: {
+          success: false,
+          taskId: "1",
+          updatedFields: [],
+          error: "Task not found",
+        },
+      },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "pending" });
+  });
+
+  it("does not apply a replayed TaskUpdate failure without structured output", () => {
+    const toolUseCache: ToolUseCache = {
+      "update-1": {
+        type: "tool_use",
+        id: "update-1",
+        name: "TaskUpdate",
+        input: { taskId: "1", status: "completed" },
+      },
+    };
+    const taskState: TaskState = new Map([["1", { subject: "Existing", status: "pending" }]]);
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: "Task #1 not found",
+          is_error: false,
+        },
       ] as any,
       "user",
       "test-session",
@@ -2047,7 +2370,7 @@ describe("toAcpNotifications - Task* tools", () => {
     );
 
     expect(notifications).toHaveLength(0);
-    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "in_progress" });
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "pending" });
   });
 
   it("does not apply TaskCreate/TaskUpdate when the tool_result reports an error", () => {
@@ -2273,6 +2596,71 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     });
   });
 
+  const PARTIAL_NOTE =
+    "NOTE: this agent stopped at its 30-turn limit before finishing. The text below is PARTIAL output; treat it as incomplete. Send the agent a message (SendMessage) to let it continue from where it stopped.";
+  const PARTIAL_LABEL = "[Agent stopped at its turn limit — the output below is partial]";
+
+  it("replaces the maxTurns partial-output note in the structured lane", () => {
+    // A maxTurns-stopped subagent still ships status "completed", with a
+    // model-directed note block leading the report — the SendMessage
+    // instruction is meaningless over ACP, but the partial-output fact isn't.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        { type: "text", text: PARTIAL_NOTE },
+        { type: "text", text: "The partial report." },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+      { type: "content", content: { type: "text", text: "The partial report." } },
+    ]);
+  });
+
+  it("replaces the note variant for an agent that produced no report", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        {
+          type: "text",
+          text: "NOTE: this agent stopped at its 5-turn limit before finishing. It was still calling tools and had produced no report.",
+        },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+    ]);
+  });
+
+  it("replaces the note paragraph in the raw fallback and still strips the trailer", () => {
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [{ type: "text", text: `${PARTIAL_NOTE}\n\nThe report.${TRAILER}` }],
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: `${PARTIAL_LABEL}\n\nThe report.` } },
+    ]);
+  });
+
+  it("leaves a report that merely mentions the note text mid-block alone", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [{ type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` }],
+    });
+
+    expect(update.content).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` },
+      },
+    ]);
+  });
+
   it("strips the trailer from the raw fallback when tool_use_result is absent", () => {
     // Replayed sessions and older CLIs have no structured report; the
     // tail-anchored strip is the only cleanup available there.
@@ -2452,6 +2840,62 @@ describe("tool_result_meta non-execution stamping", () => {
     is_error: true,
     content: "The user doesn't want to proceed with this tool use.",
   };
+
+  it("removes Claude's outer fence from a rejected ExitPlanMode explanation only", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_plan: {
+        type: "tool_use",
+        id: "toolu_plan",
+        name: "ExitPlanMode",
+        input: { plan: "Implement it" },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          is_error: true,
+          content: "```\nThe user chose to keep planning.\n```",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_plan",
+      status: "failed",
+      rawOutput: "The user chose to keep planning.",
+    });
+  });
+
+  it("preserves fenced output from tools other than ExitPlanMode", () => {
+    const fenced = "```text\ncommand output\n```";
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash",
+          content: fenced,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_bash: bashToolUse },
+      mockClient,
+      mockLogger,
+    );
+
+    expect(notifications[0].update).toMatchObject({ rawOutput: fenced });
+  });
 
   it("stamps nonExecutionKind and userFeedback on the failed tool_call_update", () => {
     const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
@@ -2893,6 +3337,150 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       });
 
       expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
+    });
+  });
+});
+
+describe("Skill tool rendering", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  describe("toolInfoFromToolUse", () => {
+    it("sets title to 'Load skill: <name>' and returns empty content", () => {
+      const info = toolInfoFromToolUse(
+        { name: "Skill", id: "toolu_1", input: { skill: "commits" } },
+        false,
+      );
+      expect(info.title).toBe("Load skill: commits");
+      expect(info.kind).toBe("other");
+      expect(info.content).toEqual([]);
+    });
+
+    it("falls back to 'Load skill' when skill name is absent", () => {
+      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_2", input: {} }, false);
+      expect(info.title).toBe("Load skill");
+      expect(info.content).toEqual([]);
+    });
+
+    it("does not throw when input is undefined", () => {
+      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_3", input: undefined }, false);
+      expect(info.title).toBe("Load skill");
+      expect(info.content).toEqual([]);
+    });
+  });
+
+  describe("toolUpdateFromToolResult", () => {
+    it("suppresses the raw 'Launching skill' result text", () => {
+      const toolUse = {
+        type: "tool_use",
+        id: "toolu_4",
+        name: "Skill",
+        input: { skill: "commits" },
+      };
+      const toolResult = {
+        type: "tool_result" as const,
+        tool_use_id: "toolu_4",
+        content: "Launching skill: commits",
+        is_error: false,
+      };
+      const update = toolUpdateFromToolResult(toolResult, toolUse, false);
+      expect(update).toEqual({});
+    });
+  });
+
+  describe("_meta.claudeCode.skill in tool_call notification", () => {
+    it("includes skill name in _meta.claudeCode when Skill tool is invoked", () => {
+      const notifications = toAcpNotifications(
+        [
+          { type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } },
+        ] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        _meta: { claudeCode: { toolName: "Skill", skill: "commits" } },
+      });
+    });
+
+    it("omits skill from _meta.claudeCode when skill name is missing", () => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_6", name: "Skill", input: {} }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      const meta = (notifications[0]?.update as any)?._meta?.claudeCode;
+      expect(meta).toBeDefined();
+      expect(meta.skill).toBeUndefined();
+    });
+  });
+
+  describe("_meta.claudeCode.skillPath", () => {
+    const skillMeta = (skill: string, cwd?: string) =>
+      (
+        toAcpNotifications(
+          [{ type: "tool_use", id: "toolu_skill_path", name: "Skill", input: { skill } }] as any,
+          "assistant",
+          "test-session",
+          {},
+          {} as AcpClient,
+          mockLogger,
+          cwd ? { cwd } : undefined,
+        )[0]?.update as any
+      )?._meta?.claudeCode;
+
+    let root: string;
+
+    beforeEach(() => {
+      root = mkdtempSync(path.join(tmpdir(), "acp-skill-path-"));
+    });
+
+    afterEach(() => {
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    const writeSkill = (relativeDir: string) => {
+      const dir = path.join(root, relativeDir);
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, "# skill\n");
+      return file;
+    };
+
+    it("resolves a project-level .claude/skills skill", () => {
+      const file = writeSkill(".claude/skills/commits");
+      expect(skillMeta("commits", root).skillPath).toBe(file);
+    });
+
+    it("resolves a project-level .agents/skills skill", () => {
+      const file = writeSkill(".agents/skills/commits");
+      expect(skillMeta("commits", root).skillPath).toBe(file);
+    });
+
+    it("resolves a directory-scoped skill spelled prefix:name", () => {
+      const file = writeSkill("apps/web/.claude/skills/deploy");
+      expect(skillMeta("apps/web:deploy", root).skillPath).toBe(file);
+    });
+
+    it("resolves a plugin skill spelled plugin:name", () => {
+      const file = writeSkill(".claude/plugins/reviewer/skills/audit");
+      expect(skillMeta("reviewer:audit", root).skillPath).toBe(file);
+    });
+
+    it("omits skillPath when no known layout holds the skill", () => {
+      const meta = skillMeta("nonexistent", root);
+      expect(meta.skill).toBe("nonexistent");
+      expect(meta.skillPath).toBeUndefined();
+    });
+
+    it("omits skillPath when the session has no cwd", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("commits").skillPath).toBeUndefined();
     });
   });
 });

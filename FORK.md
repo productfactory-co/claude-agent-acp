@@ -3,7 +3,7 @@
 Fork of [agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp)
 (Apache-2.0, LICENSE retained), published as `@productfactory/claude-agent-acp`.
 
-The `factory` branch is based on upstream v0.62.0 and carries two deliberately
+The `factory` branch is based on upstream v0.75.1 and carries two deliberately
 small deltas:
 
 1. An additive, env-gated streaming change:
@@ -15,9 +15,13 @@ small deltas:
    `FACTORY_STREAM_TOOL_INPUT=1` — default behavior is identical to upstream.
    The raw relay composes with upstream's completed-field tool-input refinements.
 
-2. `@anthropic-ai/claude-agent-sdk` is pinned to stable `0.3.220` (Claude Code
-   `2.1.220`) instead of upstream v0.62.0's `0.3.219`. The public TypeScript
-   declarations are unchanged between those SDK releases; `2.1.220` is a
-   bug-fix/reliability update.
+2. `@anthropic-ai/claude-agent-sdk` is pinned to stable `0.3.266` (Claude Code
+   `2.1.266`) instead of upstream v0.75.1's `0.3.257`, including current
+   Fable 5.1 support and subsequent SDK fixes.
 
 `main` tracks upstream; the delta is intended to be offered upstream.
+
+Local verification: `npm run build`, then
+`env -u NO_BROWSER -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY -u CLAUDE_CODE_REMOTE -u ANTHROPIC_BASE_URL npm test`.
+The environment exclusions isolate upstream login-method assertions from the host
+remote-session settings. Factory streaming regression tests remain enabled.
