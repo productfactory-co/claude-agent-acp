@@ -15,9 +15,10 @@ small deltas:
    `FACTORY_STREAM_TOOL_INPUT=1` — default behavior is identical to upstream.
    The raw relay composes with upstream's completed-field tool-input refinements.
 
-2. `@anthropic-ai/claude-agent-sdk` is pinned to stable `0.3.266` (Claude Code
-   `2.1.266`) instead of upstream v0.75.1's `0.3.257`, including current
-   Fable 5.1 support and subsequent SDK fixes.
+2. `@anthropic-ai/claude-agent-sdk` is pinned to stable `0.3.281` (Claude Code
+   `2.1.281`) instead of upstream v0.75.1's `0.3.257`, including Fable 5.1 and
+   Opus 5.5 support (the `opus` alias resolves to `claude-opus-5-5` from
+   2.1.280) and subsequent SDK fixes.
 
 The `upstream` remote tracks the original project; Factory releases land on `main`.
 The streaming delta is intended to be offered upstream.
